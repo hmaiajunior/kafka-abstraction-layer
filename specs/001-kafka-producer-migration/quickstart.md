@@ -197,7 +197,6 @@ kafka_sdk_produce_latency_seconds_bucket{topic="orders-topic",cluster="msk-produ
 ```
 kafka.sdk.correlationId=550e8400-e29b-41d4-a716-446655440000
 kafka.sdk.topic=orders-topic
-kafka.sdk.cluster=msk-production
 kafka.sdk.outcome=success
 kafka.sdk.offset=1042
 ```
