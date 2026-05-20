@@ -1,0 +1,243 @@
+name: kafka-migration-demo
+
+# Strimzi publishes Kafka container images at quay.io/strimzi/kafka — the same Kafka binary
+# the Strimzi operator deploys on Kubernetes. We bypass their default entrypoint with our
+# own start script so we can run a plain single-node KRaft broker per cluster locally.
+x-kafka-image: &kafka-image
+  image: quay.io/strimzi/kafka:latest-kafka-3.7.0
+  user: "0"
+
+services:
+  # One-shot init container that generates a CA + broker + client mTLS material per cluster
+  # into a shared named volume. Idempotent — re-running compose up skips regeneration.
+  certs:
+    image: eclipse-temurin:17-jdk-alpine
+    container_name: kafka-migration-certs
+    entrypoint: ["/bin/sh", "/scripts/gen-certs.sh"]
+    environment:
+      CERTS_DIR: /certs
+      KEYSTORE_PASS: kafka123
+      VALIDITY_DAYS: "3650"
+    volumes:
+      - kafka-certs:/certs
+      - ./docker/scripts:/scripts:ro
+
+  # ============================================================================
+  # Strimzi cluster A (source cluster — where the producer starts)
+  # ============================================================================
+  kafka-a:
+    <<: *kafka-image
+    container_name: kafka-a
+    hostname: kafka-a
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_CONFIG: /etc/kafka/server.properties
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qg"
+      LOG_DIR: /tmp/logs
+    volumes:
+      - ./docker/kafka-a/server.properties:/etc/kafka/server.properties:ro
+      - ./docker/scripts/start-kafka.sh:/usr/local/bin/start-kafka.sh:ro
+      - kafka-certs:/certs:ro
+      - kafka-a-data:/var/lib/kafka/data
+    entrypoint: ["/bin/bash", "/usr/local/bin/start-kafka.sh"]
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka-a:9092 --command-config /certs/cluster-a/admin.properties >/dev/null 2>&1"
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  # ============================================================================
+  # Strimzi cluster B (target cluster — where the producer migrates to)
+  # ============================================================================
+  kafka-b:
+    <<: *kafka-image
+    container_name: kafka-b
+    hostname: kafka-b
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    ports:
+      - "9095:9095"
+    environment:
+      KAFKA_CONFIG: /etc/kafka/server.properties
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_CLUSTER_ID: "TWFhWWtNRGN6Tk1qUkJOQg"
+      LOG_DIR: /tmp/logs
+    volumes:
+      - ./docker/kafka-b/server.properties:/etc/kafka/server.properties:ro
+      - ./docker/scripts/start-kafka.sh:/usr/local/bin/start-kafka.sh:ro
+      - kafka-certs:/certs:ro
+      - kafka-b-data:/var/lib/kafka/data
+    entrypoint: ["/bin/bash", "/usr/local/bin/start-kafka.sh"]
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka-b:9095 --command-config /certs/cluster-b/admin.properties >/dev/null 2>&1"
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  # ============================================================================
+  # Confluent Schema Registry — backed by cluster-a (one shared SR for both clusters).
+  # The SDK's ConfluentSchemaValidator talks to this over plain HTTP on :8081.
+  # ============================================================================
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.0
+    container_name: schema-registry
+    depends_on:
+      kafka-a:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: SSL://kafka-a:9092
+      SCHEMA_REGISTRY_KAFKASTORE_SECURITY_PROTOCOL: SSL
+      SCHEMA_REGISTRY_KAFKASTORE_SSL_KEYSTORE_LOCATION: /certs/cluster-a/client-a-keystore.jks
+      SCHEMA_REGISTRY_KAFKASTORE_SSL_KEYSTORE_PASSWORD: kafka123
+      SCHEMA_REGISTRY_KAFKASTORE_SSL_KEY_PASSWORD: kafka123
+      SCHEMA_REGISTRY_KAFKASTORE_SSL_TRUSTSTORE_LOCATION: /certs/cluster-a/client-a-truststore.jks
+      SCHEMA_REGISTRY_KAFKASTORE_SSL_TRUSTSTORE_PASSWORD: kafka123
+      SCHEMA_REGISTRY_KAFKASTORE_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: ""
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+      SCHEMA_REGISTRY_DEBUG: "false"
+    volumes:
+      - kafka-certs:/certs:ro
+
+  # One-shot: registers the demo Avro schema for subject `demo-events-value` so the SDK's
+  # SR connectivity check passes on producer startup.
+  schema-init:
+    image: alpine:3.19
+    container_name: schema-init
+    depends_on:
+      schema-registry:
+        condition: service_started
+    entrypoint: ["/bin/sh", "/scripts/register-schema.sh"]
+    environment:
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      SUBJECT: demo-events-value
+      SCHEMA_FILE: /schemas/demo-event.avsc
+    volumes:
+      - ./docker/scripts:/scripts:ro
+      - ./docker/schemas:/schemas:ro
+
+  # ============================================================================
+  # Kafka-UI — points at both clusters and the shared Schema Registry.
+  # Browse at http://localhost:8080
+  # ============================================================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    depends_on:
+      kafka-a:
+        condition: service_healthy
+      kafka-b:
+        condition: service_healthy
+      schema-registry:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: cluster-a
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-a:9092
+      KAFKA_CLUSTERS_0_PROPERTIES_SECURITY_PROTOCOL: SSL
+      KAFKA_CLUSTERS_0_PROPERTIES_SSL_KEYSTORE_LOCATION: /certs/cluster-a/client-a-keystore.jks
+      KAFKA_CLUSTERS_0_PROPERTIES_SSL_KEYSTORE_PASSWORD: kafka123
+      KAFKA_CLUSTERS_0_PROPERTIES_SSL_KEY_PASSWORD: kafka123
+      KAFKA_CLUSTERS_0_PROPERTIES_SSL_TRUSTSTORE_LOCATION: /certs/cluster-a/client-a-truststore.jks
+      KAFKA_CLUSTERS_0_PROPERTIES_SSL_TRUSTSTORE_PASSWORD: kafka123
+      KAFKA_CLUSTERS_0_PROPERTIES_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: ""
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+
+      KAFKA_CLUSTERS_1_NAME: cluster-b
+      KAFKA_CLUSTERS_1_BOOTSTRAPSERVERS: kafka-b:9095
+      KAFKA_CLUSTERS_1_PROPERTIES_SECURITY_PROTOCOL: SSL
+      KAFKA_CLUSTERS_1_PROPERTIES_SSL_KEYSTORE_LOCATION: /certs/cluster-b/client-b-keystore.jks
+      KAFKA_CLUSTERS_1_PROPERTIES_SSL_KEYSTORE_PASSWORD: kafka123
+      KAFKA_CLUSTERS_1_PROPERTIES_SSL_KEY_PASSWORD: kafka123
+      KAFKA_CLUSTERS_1_PROPERTIES_SSL_TRUSTSTORE_LOCATION: /certs/cluster-b/client-b-truststore.jks
+      KAFKA_CLUSTERS_1_PROPERTIES_SSL_TRUSTSTORE_PASSWORD: kafka123
+      KAFKA_CLUSTERS_1_PROPERTIES_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: ""
+      KAFKA_CLUSTERS_1_SCHEMAREGISTRY: http://schema-registry:8081
+    volumes:
+      - kafka-certs:/certs:ro
+
+  # ============================================================================
+  # Producer — Java demo app that uses the SDK. Cluster target is selected entirely
+  # via KAFKA_SDK_* env vars (see .env / .env.example). Switching clusters is a pure
+  # restart with a different env set; no source code touches Kafka types directly.
+  # ============================================================================
+  producer:
+    build:
+      context: .
+      dockerfile: demo/Dockerfile
+    image: kafka-migration-demo:latest
+    container_name: producer
+    depends_on:
+      kafka-a:
+        condition: service_healthy
+      kafka-b:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
+    command: ["-cp", "/app/demo.jar", "com.kafka.demo.DemoProducer"]
+    environment:
+      KAFKA_SDK_CLUSTER_NAME: ${PRODUCER_CLUSTER:-cluster-a}
+      KAFKA_SDK_CLUSTER_TYPE: STRIMZI_MTLS
+      KAFKA_SDK_AUTH_MECHANISM: MTLS
+      KAFKA_SDK_BOOTSTRAP_SERVERS: ${PRODUCER_BOOTSTRAP:-kafka-a:9092}
+      KAFKA_SDK_TLS_KEYSTORE_PATH: ${PRODUCER_KEYSTORE:-/certs/cluster-a/client-a-keystore.jks}
+      KAFKA_SDK_TLS_KEYSTORE_PASS: kafka123
+      KAFKA_SDK_TLS_TRUSTSTORE_PATH: ${PRODUCER_TRUSTSTORE:-/certs/cluster-a/client-a-truststore.jks}
+      KAFKA_SDK_TLS_TRUSTSTORE_PASS: kafka123
+      KAFKA_SDK_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      DEMO_TOPIC: ${DEMO_TOPIC:-demo-events}
+      DEMO_INTERVAL_MS: ${DEMO_INTERVAL_MS:-1500}
+      DEMO_SOURCE: producer
+    volumes:
+      - kafka-certs:/certs:ro
+
+  # ============================================================================
+  # Consumer — plain kafka-clients (no SDK dependency). Configurable target cluster
+  # via env vars so you can observe traffic on whichever side of the migration.
+  # ============================================================================
+  consumer:
+    build:
+      context: .
+      dockerfile: demo/Dockerfile
+    image: kafka-migration-demo:latest
+    container_name: consumer
+    depends_on:
+      kafka-a:
+        condition: service_healthy
+      kafka-b:
+        condition: service_healthy
+    command: ["-cp", "/app/demo.jar", "com.kafka.demo.DemoConsumer"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${CONSUMER_BOOTSTRAP:-kafka-a:9092}
+      KAFKA_SSL_KEYSTORE_LOCATION: ${CONSUMER_KEYSTORE:-/certs/cluster-a/client-a-keystore.jks}
+      KAFKA_SSL_KEYSTORE_PASSWORD: kafka123
+      KAFKA_SSL_KEY_PASSWORD: kafka123
+      KAFKA_SSL_TRUSTSTORE_LOCATION: ${CONSUMER_TRUSTSTORE:-/certs/cluster-a/client-a-truststore.jks}
+      KAFKA_SSL_TRUSTSTORE_PASSWORD: kafka123
+      DEMO_TOPIC: ${DEMO_TOPIC:-demo-events}
+      DEMO_GROUP_ID: ${CONSUMER_GROUP:-demo-consumer}
+      DEMO_CLUSTER_NAME: ${CONSUMER_CLUSTER:-cluster-a}
+    volumes:
+      - kafka-certs:/certs:ro
+
+volumes:
+  kafka-certs:
+  kafka-a-data:
+  kafka-b-data:
